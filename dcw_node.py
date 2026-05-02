@@ -22,12 +22,23 @@ def _pad_even(x):
     """
     Pad H and W to even numbers if necessary (Haar DWT requires even dims).
     Returns (padded_tensor, (original_H, original_W)).
+
+    PyTorch reflect padding rules (elements in tuple = 2 × number of padded dims,
+    specified from last dim to first):
+        4-D tensor → 4-element tuple  (pads W and H)
+        5-D tensor → 6-element tuple  (pads W, H, and T with 0)
+
+    Cosmos VAE (used by Anima) compresses space by 8x, so e.g. resolution
+    1208 -> latent H 151 (odd), which triggers this path on a 5-D video tensor.
     """
     H, W = x.shape[-2], x.shape[-1]
     ph, pw = H % 2, W % 2
     if ph or pw:
-        # reflect pad: safe as long as each dim >= 2 (always true for latents)
-        x = F.pad(x, (0, pw, 0, ph), mode="reflect")
+        # (0, pw, 0, ph) covers W and H
+        # prepend (0, 0) for every extra leading dim beyond 4-D
+        extra = max(0, x.dim() - 4)
+        pad = (0, pw, 0, ph) + (0, 0) * extra
+        x = F.pad(x, pad, mode="reflect")
     return x, (H, W)
 
 
