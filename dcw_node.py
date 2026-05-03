@@ -248,31 +248,35 @@ class DCWModelPatch:
 
                 "lambda_l": ("FLOAT", {
                     "default": 0.05,
-                    "min":     0.0,
+                    "min":    -0.5,
                     "max":     0.5,
                     "step":    0.005,
                     "round":   0.001,
                     "tooltip": (
                         "Low-frequency correction strength.\n"
+                        "Positive: push x0_pred toward x_t (more signal).\n"
+                        "Negative: push x0_pred away from x_t (less signal).\n"
                         "Active mainly in EARLY denoising steps.\n"
-                        "Corrects coarse structure / global composition.\n"
                         "Start around 0.04–0.07 for DDPM/EDM models.\n"
-                        "For flow-based models (Flux, Anima/Cosmos), try 2×."
+                        "For flow-based models (Flux, Anima/Cosmos), try 2×.\n"
+                        "Negative range: try -0.01 ~ -0.05 to reduce over-saturation."
                     ),
                 }),
 
                 "lambda_h": ("FLOAT", {
                     "default": 0.01,
-                    "min":     0.0,
+                    "min":    -0.3,
                     "max":     0.3,
                     "step":    0.001,
                     "round":   0.001,
                     "tooltip": (
                         "High-frequency correction strength.\n"
+                        "Positive: push x0_pred toward x_t (more detail).\n"
+                        "Negative: push x0_pred away from x_t (less detail).\n"
                         "Active mainly in LATE denoising steps.\n"
-                        "Corrects fine detail, edges, and texture.\n"
                         "Start around 0.008–0.015 for DDPM/EDM models.\n"
-                        "For flow-based models (Flux, Anima/Cosmos), try 2×."
+                        "For flow-based models (Flux, Anima/Cosmos), try 2×.\n"
+                        "Negative range: try -0.005 ~ -0.01 to reduce over-sharpening."
                     ),
                 }),
 
