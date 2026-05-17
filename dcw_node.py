@@ -28,13 +28,17 @@ Architecture overview
     SMC only  (alpha_l = alpha_h = 0):
         e      = cond − uncond
         s      = (e − e_prev) + λ · e_prev
-        e*     = e − k · sign(s)              (element-wise sign, adaptive clamp)
+        s_sm   = Gaussian(s)                      smooth spatial spikes
+        τ      = mean|s_sm|                       adaptive scale
+        e*     = e − k · tanh(s_sm / τ)          proportional switching
         output = uncond + w · e*
 
     SMC + CWM  (full integration — the new combined path):
         e      = cond − uncond
         s      = (e − e_prev) + λ · e_prev
-        e*     = e − k · sign(s)              (element-wise sign, adaptive clamp)
+        s_sm   = Gaussian(s)
+        τ      = mean|s_sm|
+        e*     = e − k · tanh(s_sm / τ)
         e_prev ← e*
         DWT(e*) → LL*, LH*, HL*, HH*
         output = uncond + IDWT(w_LL·LL*, w_mid·LH*, w_mid·HL*, w_HH·HH*)
@@ -84,8 +88,7 @@ SMC_PRESET_NAMES: list[str] = ["Off", "Auto"] + list(_SMC_PRESETS.keys())
 # model_options is a fresh dict per KSampler run → auto-resets between runs.
 _SMC_STATE_KEY = "_dcw_smc_state"
 
-# SMC adaptive clamp constants  (Supplementary Eq. 45)
-_SMC_CLAMP_RATIO = 0.5
+# SMC minimum scale guard (prevents division by zero in tanh normalisation)
 _SMC_CLAMP_MIN   = 1e-6
 
 
@@ -279,6 +282,65 @@ def _ch_energy_weight(x: torch.Tensor,
     return (energy / mean_e).clamp(clamp_lo, clamp_hi).to(x.dtype)
 
 
+# Gaussian kernel parameters for SMC smooth switching
+_SMC_BLUR_KERNEL_SIZE = 5
+_SMC_BLUR_SIGMA       = 1.0
+
+
+def _gaussian_blur_2d(x: torch.Tensor,
+                      kernel_size: int = _SMC_BLUR_KERNEL_SIZE,
+                      sigma: float     = _SMC_BLUR_SIGMA) -> torch.Tensor:
+    """
+    Separable 2-D Gaussian blur applied to the last two spatial dimensions.
+
+    Handles arbitrary leading dimensions (4-D image, 5-D video latents).
+    The blur removes high-frequency spatial spikes from the SMC sliding
+    surface s before tanh switching, preventing checkerboard artifacts
+    that arise from element-wise sign(s).
+
+    Implementation:
+        1-D Gaussian kernel built analytically (no scipy dependency).
+        Applied as two successive 1-D conv ops (rows then cols) for O(k)
+        cost rather than O(k²) from a full 2-D kernel.
+        Reflect padding preserves border behaviour without edge discontinuities.
+
+    Parameters
+    ----------
+    x           : input tensor  (..., H, W)  — expected float32 from SMC upcast
+    kernel_size : must be odd; defaults to 5
+    sigma       : Gaussian σ in pixels; defaults to 1.0
+    """
+    # Build 1-D Gaussian kernel (CPU, then move to x.device)
+    half  = kernel_size // 2
+    coords = torch.arange(kernel_size, dtype=torch.float32) - half   # [-2,-1,0,1,2]
+    kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+    kernel_1d = (kernel_1d / kernel_1d.sum()).to(device=x.device, dtype=x.dtype)
+
+    # Reshape input to (N, C, H, W) for F.conv2d, preserving leading dims
+    orig_shape = x.shape
+    if x.dim() == 4:
+        t = x
+    elif x.dim() > 4:
+        # Fold all leading dims (B, C, T, ...) into batch dim
+        t = x.reshape(-1, 1, orig_shape[-2], orig_shape[-1])
+    else:
+        t = x.unsqueeze(0)
+
+    C = t.shape[1] if t.dim() == 4 else 1
+
+    # Kernels: (out_ch, in_ch/groups, 1, k) and (out_ch, in_ch/groups, k, 1)
+    k_row = kernel_1d.view(1, 1, 1, kernel_size).expand(C, 1, 1, kernel_size)
+    k_col = kernel_1d.view(1, 1, kernel_size, 1).expand(C, 1, kernel_size, 1)
+
+    pad = kernel_size // 2
+    t = F.pad(t, (pad, pad, 0,   0), mode="reflect")
+    t = F.conv2d(t, k_row, groups=C)
+    t = F.pad(t, (0,   0, pad, pad), mode="reflect")
+    t = F.conv2d(t, k_col, groups=C)
+
+    return t.reshape(orig_shape)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DCW Core  (post-CFG: corrects x0_pred)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,20 +499,27 @@ def apply_cfg_combined(
             nan=0.0, posinf=0.0, neginf=0.0,
         )
 
-        # Switching control: Δe = -k · sign(s)  (element-wise sign, per paper/official code)
-        # Official README: u_sw = -K * sign(s_t)
-        # B also uses torch.sign(s) as default (switch_mode="sign")
-        delta_e_raw = -smc_k * torch.sign(s)
-
-        # Adaptive clamp  |Δe| ≤ 0.5 × mean|e|
-        # Guards against switching term dominating when s is large in early steps.
-        # Not in the original paper but a safe numerical guard; B omits it too,
-        # however it costs nothing and prevents rare blow-ups.
-        reduce_dims = tuple(range(1, s.ndim))
-        max_delta = (
-            _SMC_CLAMP_RATIO * e_smc.abs().mean(dim=reduce_dims, keepdim=True)
-        ).clamp(min=_SMC_CLAMP_MIN)
-        delta_e = delta_e_raw.clamp(-max_delta, max_delta)
+        # Switching control: Gaussian smoothing → tanh  (replaces sign(s))
+        #
+        # Original paper uses:  u_sw = −k · sign(s)
+        # This produces element-wise ±k — a hard checkerboard pattern that
+        # causes spatial spike artifacts and discrete semantic jumps in
+        # multi-channel VAEs (Cosmos 16-ch, Anima).
+        #
+        # Replacement (README Sec "원본 논문 대비 개선"):
+        #   s_smooth = Gaussian(s)          — removes spatial spikes
+        #   τ        = mean|s_smooth|       — step/model-agnostic adaptive scale
+        #   Δe       = −k · tanh(s_smooth / τ)
+        #
+        # Properties vs sign(s):
+        #   • Spatially continuous — no checkerboard ±1 pattern
+        #   • Proportional to |s| — small surface → weak correction
+        #   • Bounded ∈ (−k, +k) — Lyapunov stability preserved
+        #   • τ normalisation makes k model/step invariant
+        s_smooth = _gaussian_blur_2d(s)
+        reduce_dims = tuple(range(1, s_smooth.ndim))
+        tau     = s_smooth.abs().mean(dim=reduce_dims, keepdim=True).clamp(min=_SMC_CLAMP_MIN)
+        delta_e = -smc_k * torch.tanh(s_smooth / tau)
 
         e_star = torch.nan_to_num(e_smc + delta_e, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -467,7 +536,12 @@ def apply_cfg_combined(
 
         w_LL  = w * (1.0 + float(alpha_l) * s_n)
         w_HH  = w * (1.0 + float(alpha_h) * (1.0 - s_n))
-        w_mid = (w_LL + w_HH) * 0.5
+        # Geometric mean for LH/HL: physically correct for a band that lies
+        # between LL and HH in the coarse-to-fine hierarchy.
+        # AM ≥ GM always, so arithmetic mean systematically over-weights the
+        # mid-band; geometric mean keeps energy scaling consistent with the
+        # log-linear interpolation implicit in wavelet decomposition.
+        w_mid = (w_LL * w_HH) ** 0.5
 
         e_p, (H, W) = _pad_even(e)
         LL_e, LH_e, HL_e, HH_e = haar_dwt2d(e_p)
