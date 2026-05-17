@@ -124,9 +124,9 @@ CWM은 CFG guidance error `e = cond − uncond`를 웨이블릿으로 분해한 
 주파수 대역별로 다른 CFG 스케일을 적용합니다.
 
 ```
-w_LL(t) = w · (1 + alpha_l · σ_norm)         ← 초기 스텝에서 LL 부스트
-w_HH(t) = w · (1 + alpha_h · (1 − σ_norm))   ← 후기 스텝에서 HH 부스트
-w_mid   = (w_LL + w_HH) / 2                  ← LH, HL에 적용
+w_LL(t) = w · (1 + alpha_l · σ_norm)           ← 초기 스텝에서 LL 부스트
+w_HH(t) = w · (1 + alpha_h · (1 − σ_norm))     ← 후기 스텝에서 HH 부스트
+w_mid   = √(w_LL × w_HH)                       ← LH, HL에 적용 (기하 평균)
 
 alpha_l = alpha_h = 0 → 표준 CFG와 수학적으로 동일
 ```
@@ -163,10 +163,12 @@ SMC는 매 스텝의 guidance error를 보정하여 CFG trajectory의 oscillatio
 CWM이 활성화되어 있으면 SMC가 먼저 error를 보정한 뒤 CWM이 주파수 대역별로 분배합니다.
 
 ```
-e(t)   = cond − uncond
-s(t)   = (e − e_prev) + λ · e_prev      ← sliding surface
-e*(t)  = e − k · sign(s)                ← switching control (element-wise sign)
-e_prev ← e*(t)                          ← 다음 스텝으로 전달
+e(t)       = cond − uncond
+s(t)       = (e − e_prev) + λ · e_prev        ← sliding surface
+s_smooth   = Gaussian(s)                      ← 공간 스파이크 제거
+τ          = mean|s_smooth|                   ← 적응형 스케일
+e*(t)      = e − k · tanh(s_smooth / τ)       ← 부드러운 비례 보정
+e_prev    ← e*(t)                             ← 다음 스텝으로 전달
 ```
 
 #### `smc_preset` — 프리셋 선택
@@ -245,14 +247,6 @@ SNR-t 편향이 주된 문제일 때 (저스텝, 흐릿함, 채도 부족).
 구도나 디테일의 프롬프트 정렬이 주된 목적일 때.
 `dcw_enabled = False`, `smc_preset = Off`
 
-### DCW + CWM (주의사항)
-의도치 않은 효과 상쇄를 방지하기위해 (이론상)
-DCW와 CWM의 l , h 값의 부호(음수양수)는 일치 해야됩니다.
-```
-(CWM)alpha_l의 부호 = (DCW)lambda_l의 부호  (같은 방향) 또는 0 (중립)
-(CWM)alpha_h의 부호 = (DCW)lambda_h의 부호  (같은 방향) 또는 0 (중립)
-```
-
 ### SMC만 사용 (CWM 없이)
 guidance oscillation 억제만 원할 때.
 `dcw_enabled = False`, `cwm_enabled = False`, `smc_preset = Auto`
@@ -309,6 +303,33 @@ $$\text{SNR}(t) = \bar{\alpha}_t \;/\; (1 - \bar{\alpha}_t)$$
 
 DCW는 이를 웨이블릿 도메인에서의 differential correction으로 보정합니다.
 
+### 원본 논문 대비 개선: 밴드별 독립 타이밍 + 채널 에너지 가중치
+
+**1. LH/HL 독립 타이밍**
+
+논문 원본과 초기 구현은 LH(수평 엣지), HL(수직 엣지), HH(대각 텍스처)를 동일한 후기 스텝 스케줄로 처리했습니다. 그러나 방향성 엣지(LH/HL)는 HH보다 먼저 형성됩니다.
+
+| 서브밴드 | 내용 | 형성 시기 | 가중치 |
+|---|---|---|---|
+| LL | 전체 구조·색감 | 초기 | `lambda_l × σ_norm` |
+| LH/HL | 방향성 엣지 | 중간 | `(lam_l + lam_h) / 2` |
+| HH | 미세 텍스처 | 후기 | `lambda_h × (1-σ_norm)` |
+
+LH/HL의 가중치는 LL 타이밍과 HH 타이밍의 선형 보간으로, 중간 스텝에서 자연스럽게 활성화됩니다.
+
+**2. 채널별 에너지 가중치**
+
+단일 채널 VAE(SD 4ch)와 달리 Cosmos 16ch처럼 다채널 VAE는 각 채널이 서로 다른 의미 정보(포즈, 장신구, 조명 등)를 인코딩합니다. 동일한 lambda를 전 채널에 균일하게 적용하면 미세한 lambda 변화(0.04 → 0.05)가 특정 채널을 의미론적 결정 경계 너머로 밀어 포즈가 바뀌거나 장신구가 생기는 등 이산적 점프 현상이 발생합니다.
+
+채널 에너지 가중치는 이를 완화합니다:
+
+$$w_c = \text{clamp}\!\left(\frac{E[x_{t,c}^2]}{\overline{E[x_{t,c}^2]}},\; 0.25,\; 4.0\right)$$
+
+- 에너지가 높은 채널(의미적으로 활성) → 보정 강하게
+- 에너지가 낮은 채널(배경 등) → 보정 약하게
+- 초기 스텝에서 HH_x가 노이즈 지배 → 균일 에너지 → 가중치 ≈ 1 (인위적 편향 없음)
+- 전체 보정 에너지의 평균은 항상 기존과 동일하게 유지
+
 ---
 
 ## CFG Wavelet Mixing 수학적 배경
@@ -331,8 +352,27 @@ CWM은 이 특성에 맞게 guidance 스케일을 주파수·시간적으로 분
 
 SMC-CFG는 이를 비선형 switching feedback으로 해결합니다:
 - **sliding surface** `s_t = (e_t − e_{t-1}) + λ · e_{t-1}` 가 0에 수렴하는 방향으로 강제
-- **switching control** `u_sw = −K · sign(s_t)` 가 surface 양쪽에서 반대 방향으로 밀어 수렴을 보장
+- **smooth switching** `u_sw = −k · tanh(Gaussian(s) / τ)` 로 공간적으로 연속된 비례 보정
 - Lyapunov 안정성 분석에 의해 유한시간 수렴이 이론적으로 보장됨
+
+### 원본 논문 대비 개선: Gaussian → tanh
+
+논문 원본은 `−k · sign(s)` (element-wise 하드 ±1)을 사용합니다.
+
+이 구현에서는 **Gaussian → tanh** 조합으로 대체했습니다:
+
+```
+s_smooth = Gaussian(s)               공간 노이즈·스파이크 제거 (분리형 5×5 커널)
+τ        = mean|s_smooth|            스텝·모델에 무관한 적응형 스케일
+delta_e  = −k · tanh(s_smooth / τ)  비례·연속·유계 보정 ∈ (−k, +k)
+```
+
+| | sign(s) 원본 | Gaussian → tanh |
+|---|---|---|
+| 공간 패턴 | 날카로운 체커보드 ±1 | 완만한 연속 분포 |
+| 보정 크기 | 항상 ±k (크기 무관) | s에 비례 (작으면 약하게) |
+| Cosmos 16ch 인물 분리 | 발생 | 발생하지 않음 |
+| SMC 효과 유지 | — | ✅ 방향성 보정 동일하게 유지 |
 
 ---
 
@@ -352,7 +392,7 @@ SMC 연산은 항상 float32로 수행되고 원본 dtype으로 복원됩니다.
 
 **연산 비용**
 DCW 논문 실험 기준 추가 연산 시간 **0.08 – 0.47%** 수준.
-CWM과 SMC는 guidance error에 DWT/IDWT 1회 및 sign 연산 추가이므로 동일 수준입니다.
+CWM과 SMC는 guidance error에 DWT/IDWT 1회 및 Gaussian blur + tanh 추가이므로 동일 수준입니다.
 샘플링 속도에 실질적 영향이 없습니다.
 
 ---

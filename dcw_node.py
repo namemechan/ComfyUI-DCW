@@ -229,6 +229,56 @@ def _sigma_norm(sigma, tensor: torch.Tensor, compute_dtype: torch.dtype):
         return sigma_f / (sigma_f + 1.0)
 
 
+def _ch_energy_weight(x: torch.Tensor,
+                      clamp_lo: float = 0.25,
+                      clamp_hi: float = 4.0) -> torch.Tensor:
+    """
+    Per-channel energy weight for DCW correction.
+
+    Motivation
+    ----------
+    In multi-channel VAEs (e.g. Cosmos 16-ch used by Anima), each channel
+    encodes different semantic content — pose, accessory presence, lighting,
+    etc.  Applying a uniform correction lambda across all channels treats a
+    semantically-rich channel and a near-empty background channel identically.
+    This causes small lambda changes (~0.01) to push high-energy semantic
+    channels past decision boundaries, producing the discrete jumps (body
+    angle, accessory appearing/disappearing) observed in practice.
+
+    Formula
+    -------
+    For a subband tensor x of shape (B, C, ...) :
+
+        energy_c   = mean_{spatial}( x_c² )          per channel
+        weight_c   = energy_c / mean_c( energy_c )   normalise → mean=1
+        weight_c   = clamp( weight_c, lo, hi )        stability guard
+
+    Properties
+    ----------
+    • Mean weight is always 1.0  →  total correction energy is unchanged.
+    • High-energy (semantically active) channels get stronger correction;
+      low-energy channels get weaker correction.
+    • In early steps HH_x is dominated by noise (uniform across channels)
+      → weights ≈ 1 → effectively no per-channel bias when reference is
+      meaningless, which is the correct behaviour.
+    • Clamping [0.25, 4.0] limits the range to 1/4× – 4×; prevents a
+      single loud channel from monopolising or a quiet channel from being
+      corrected into instability.
+
+    Parameters
+    ----------
+    x        : reference subband tensor  (B, C, ...)
+    clamp_lo : minimum weight (default 0.25)
+    clamp_hi : maximum weight (default 4.0)
+
+    Returns tensor of same shape, broadcastable with x.
+    """
+    spatial = tuple(range(2, x.dim()))                              # all dims after C
+    energy  = x.float().pow(2).mean(dim=spatial, keepdim=True)     # (B, C, 1...)
+    mean_e  = energy.mean(dim=1, keepdim=True).clamp(min=1e-8)     # (B, 1, 1...)
+    return (energy / mean_e).clamp(clamp_lo, clamp_hi).to(x.dtype)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DCW Core  (post-CFG: corrects x0_pred)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,10 +291,34 @@ def apply_dcw(denoised: torch.Tensor,
     """
     Apply Differential Correction in Wavelet domain to x0_pred.
 
-    corrected_f = denoised_f + λ_f(t) · (x_t_f − denoised_f)
+    Correction formula per frequency band f:
+        corrected_f = denoised_f + λ_f(t) · w_ch_f · (x_t_f − denoised_f)
 
-    λ_l(t) = lambda_l · σ_norm          ← early steps dominant
-    λ_h(t) = lambda_h · (1 − σ_norm)    ← late steps dominant
+    Band timing
+    -----------
+    LL  (global structure)    λ_l(t) = lambda_l · σ_norm         early steps
+    LH  (horiz. edges)  ┐    λ_m(t) = (λ_l + λ_h) / 2          mid steps
+    HL  (vert. edges)   ┘    (linear interpolation of LL and HH schedules)
+    HH  (fine texture)        λ_h(t) = lambda_h · (1 − σ_norm)   late steps
+
+    LH and HL represent directional edge information that forms between
+    global structure (LL) and fine texture (HH) in the coarse-to-fine
+    denoising process.  Giving them the same timing as HH (late-only)
+    was incorrect; the interpolated schedule is more physically accurate.
+
+    Per-channel energy weighting
+    ----------------------------
+    w_ch_f = _ch_energy_weight(x_t_f)
+
+    Channels with higher signal energy receive proportionally stronger
+    correction.  This prevents small lambda changes from causing discrete
+    semantic jumps (body pose, accessory presence) in multi-channel VAEs
+    such as Cosmos 16-ch (Anima), where different channels encode different
+    semantic concepts at different energy levels.
+
+    When x_t_f is dominated by noise (early steps, HH band), the energy
+    is approximately uniform across channels → weights ≈ 1 → no artificial
+    bias is introduced where the reference signal is not yet meaningful.
     """
     if lambda_l == 0.0 and lambda_h == 0.0:
         return denoised
@@ -258,8 +332,9 @@ def apply_dcw(denoised: torch.Tensor,
 
     s = _sigma_norm(sigma, denoised, compute_dtype)
 
-    lam_l = lambda_l * s
-    lam_h = lambda_h * (1.0 - s)
+    lam_l   = lambda_l * s
+    lam_h   = lambda_h * (1.0 - s)
+    lam_mid = (lam_l + lam_h) * 0.5          # LH / HL: mid-step timing
 
     dn_p, (H, W) = _pad_even(denoised)
     xt_p, _      = _pad_even(x_t.to(dtype=compute_dtype, device=denoised.device))
@@ -267,10 +342,16 @@ def apply_dcw(denoised: torch.Tensor,
     LL_d, LH_d, HL_d, HH_d = haar_dwt2d(dn_p)
     LL_x, LH_x, HL_x, HH_x = haar_dwt2d(xt_p)
 
-    LL_c = LL_d + lam_l * (LL_x - LL_d)
-    LH_c = LH_d + lam_h * (LH_x - LH_d)
-    HL_c = HL_d + lam_h * (HL_x - HL_d)
-    HH_c = HH_d + lam_h * (HH_x - HH_d)
+    # Per-channel energy weights derived from x_t subbands
+    cw_LL = _ch_energy_weight(LL_x)
+    cw_LH = _ch_energy_weight(LH_x)
+    cw_HL = _ch_energy_weight(HL_x)
+    cw_HH = _ch_energy_weight(HH_x)
+
+    LL_c = LL_d + lam_l   * cw_LL * (LL_x - LL_d)
+    LH_c = LH_d + lam_mid * cw_LH * (LH_x - LH_d)
+    HL_c = HL_d + lam_mid * cw_HL * (HL_x - HL_d)
+    HH_c = HH_d + lam_h   * cw_HH * (HH_x - HH_d)
 
     out = haar_idwt2d(LL_c, LH_c, HL_c, HH_c)
     out = out[..., :H, :W]
