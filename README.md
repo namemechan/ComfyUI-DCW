@@ -163,12 +163,12 @@ SMC는 매 스텝의 guidance error를 보정하여 CFG trajectory의 oscillatio
 CWM이 활성화되어 있으면 SMC가 먼저 error를 보정한 뒤 CWM이 주파수 대역별로 분배합니다.
 
 ```
-e(t)       = cond − uncond
-s(t)       = (e − e_prev) + λ · e_prev        ← sliding surface
-s_smooth   = Gaussian(s)                      ← 공간 스파이크 제거
-τ          = mean|s_smooth|                   ← 적응형 스케일
-e*(t)      = e − k · tanh(s_smooth / τ)       ← 부드러운 비례 보정
-e_prev    ← e*(t)                             ← 다음 스텝으로 전달
+e(t)   = cond − uncond
+s(t)   = (e − e_prev) + λ · e_prev        ← sliding surface
+‖s‖₂  = L2 norm (배치 샘플별 독립)
+Δe     = −k · s / ‖s‖₂                   ← unit_2 switching (논문 Table 4)
+e*(t)  = e + Δe                           ← 보정 총 에너지 = 항상 k
+e_prev ← e*(t)                            ← 다음 스텝으로 전달
 ```
 
 #### `smc_preset` — 프리셋 선택
@@ -196,6 +196,9 @@ e_prev    ← e*(t)                             ← 다음 스텝으로 전달
 #### `smc_k` — switching gain k
 
 `smc_preset = Custom`일 때만 적용됩니다.
+
+unit_2 방식에서 k는 매 스텝 보정 벡터의 L2 norm을 정확히 k로 고정합니다.
+해상도나 채널 수와 무관하게 보정 에너지가 일정하게 유지됩니다.
 
 | 값 범위 | 효과 |
 |---------|------|
@@ -352,27 +355,27 @@ CWM은 이 특성에 맞게 guidance 스케일을 주파수·시간적으로 분
 
 SMC-CFG는 이를 비선형 switching feedback으로 해결합니다:
 - **sliding surface** `s_t = (e_t − e_{t-1}) + λ · e_{t-1}` 가 0에 수렴하는 방향으로 강제
-- **smooth switching** `u_sw = −k · tanh(Gaussian(s) / τ)` 로 공간적으로 연속된 비례 보정
+- **unit_2 switching** `u_sw = −k · s / ‖s‖₂` 로 방향 정보를 보존하는 정규화 보정
 - Lyapunov 안정성 분석에 의해 유한시간 수렴이 이론적으로 보장됨
 
-### 원본 논문 대비 개선: Gaussian → tanh
+### 논문 정의: sign(s) ≡ s / ‖s‖₂ (unit_2)
 
-논문 원본은 `−k · sign(s)` (element-wise 하드 ±1)을 사용합니다.
-
-이 구현에서는 **Gaussian → tanh** 조합으로 대체했습니다:
+논문 Table 4 / Notation Table은 `sign(s_t) ≡ s_t / ‖s_t‖₂` 로 명시합니다.
+이는 element-wise ±1이 아니라 **텐서 전체를 L2 단위벡터로 정규화**하는 연산입니다.
 
 ```
-s_smooth = Gaussian(s)               공간 노이즈·스파이크 제거 (분리형 5×5 커널)
-τ        = mean|s_smooth|            스텝·모델에 무관한 적응형 스케일
-delta_e  = −k · tanh(s_smooth / τ)  비례·연속·유계 보정 ∈ (−k, +k)
+s      = (e − e_prev) + λ · e_prev
+‖s‖₂  = L2 norm (배치 샘플별 독립 계산)
+Δe     = −k · s / ‖s‖₂               보정의 총 에너지 = 항상 k로 고정
+e*     = e + Δe
 ```
 
-| | sign(s) 원본 | Gaussian → tanh |
+| | element-wise sign(s) | unit_2: s / ‖s‖₂ (논문 정의) |
 |---|---|---|
-| 공간 패턴 | 날카로운 체커보드 ±1 | 완만한 연속 분포 |
-| 보정 크기 | 항상 ±k (크기 무관) | s에 비례 (작으면 약하게) |
-| Cosmos 16ch 인물 분리 | 발생 | 발생하지 않음 |
-| SMC 효과 유지 | — | ✅ 방향성 보정 동일하게 유지 |
+| 보정 총 에너지 | k × √(H×W×C) — 해상도에 비례 | 항상 k로 고정 |
+| 공간 패턴 | 모든 위치 균등하게 ±k | s의 방향 구조 보존 |
+| Lyapunov 안정성 | 비보장 | 이론적으로 보장 |
+| Cosmos 16ch 채널 분리 | 에너지 발산 위험 | 보정 에너지 유계 |
 
 ---
 
@@ -392,7 +395,7 @@ SMC 연산은 항상 float32로 수행되고 원본 dtype으로 복원됩니다.
 
 **연산 비용**
 DCW 논문 실험 기준 추가 연산 시간 **0.08 – 0.47%** 수준.
-CWM과 SMC는 guidance error에 DWT/IDWT 1회 및 Gaussian blur + tanh 추가이므로 동일 수준입니다.
+CWM과 SMC는 guidance error에 DWT/IDWT 1회 및 L2 norm 연산이 추가되므로 동일 수준입니다.
 샘플링 속도에 실질적 영향이 없습니다.
 
 ---
