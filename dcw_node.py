@@ -427,7 +427,17 @@ def apply_cfg_combined(
         e_smc = e.to(dtype=smc_dtype)
 
         e_prev_raw = smc_state.get("e_prev")
-        if e_prev_raw is None:
+        if e_prev_raw is None or e_prev_raw.shape != e_smc.shape:
+            # First step OR resolution changed (e.g. SPEED spectral expansion):
+            # reset e_prev = e so SMC restarts cleanly at the new resolution.
+            # This prevents the tensor size mismatch that occurs when
+            # spectral_expand changes spatial dims between sampler segments.
+            if e_prev_raw is not None and e_prev_raw.shape != e_smc.shape:
+                print(
+                    f"[CWM/SMC] Resolution change detected "
+                    f"({list(e_prev_raw.shape)} → {list(e_smc.shape)}): "
+                    f"resetting SMC state."
+                )
             # First step: initialise e_prev = e  (Algorithm 1, line 7-9)
             e_prev = e_smc.detach().clone()
         else:
