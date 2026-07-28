@@ -1,6 +1,6 @@
 # ComfyUI-DCW
 
-**Differential Correction in Wavelet domain** + **CFG Wavelet Mixing** + **Sliding Mode Control CFG**
+**Differential Correction in Wavelet domain** + **CFG Wavelet Mixing** + **Sliding Mode Control CFG** + **Band-wise Reverse Drift Compensation**
 
 > **DCW 논문**: *Elucidating the SNR-t Bias of Diffusion Probabilistic Models*
 > Yu et al., arXiv:2604.16044v1 (2026)
@@ -9,6 +9,9 @@
 > **SMC 논문**: *CFG-Ctrl: Control-Based Classifier-Free Diffusion Guidance*
 > Wang et al., CVPR 2026 / arXiv:2603.03281
 > 코드: https://github.com/THU-SI/CFG-Ctrl
+
+> **RDC**: 본 저장소 자체 확장 기능. 외부 논문 선례 확인 안 됨(전수조사 아님, §"RDC 배경" 참고).
+> 원형 개념(전역 단일 텐서 EMA drift 보정)을 DCW의 wavelet band 구조에 맞춰 대역별로 재설계.
 
 ---
 
@@ -21,8 +24,11 @@
 | **DCW** | `sampler_post_cfg_function` (x0_pred 후처리) | SNR-t 편향 보정 |
 | **CWM** | `sampler_cfg_function` (CFG 계산 대체) | 주파수 대역별 adaptive CFG |
 | **SMC** | CWM 훅 내부 (CWM 이전 단계) | guidance error의 oscillation 억제 및 semantic alignment 개선 |
+| **RDC** | DCW 훅 내부 (wavelet 분해 재사용) | 여러 step에 걸친 구도/포즈 누적 drift 억제 |
 
 각각 독립적으로 켜고 끌 수 있으며, 조합해서 사용할 수도 있습니다.
+
+> DCW는 "이번 step이 원래 궤적에서 얼마나 벗어났는지"(순간 보정), RDC는 "여러 step에 걸쳐 누적되는 drift"(궤적 보정)를 다룹니다. 서로 다른 문제라 개입 위치가 같아도(DCW 훅 내부) 역할이 겹치지 않습니다.
 
 ---
 
@@ -43,7 +49,7 @@ ComfyUI/
 
 ## 사용 방법
 
-노드 탐색기에서 **`DCW + CWM + SMC Model Patch`** 를 검색하거나
+노드 탐색기에서 **`DCW(+a)`** 를 검색하거나
 `model_patches` 카테고리에서 찾으세요.
 
 ### 기본 연결
@@ -51,7 +57,7 @@ ComfyUI/
 ```
 [Load Checkpoint]
       ↓
-[DCW + CWM + SMC Model Patch]  ← 파라미터 설정
+[DCW(+a)]  ← 파라미터 설정
       ↓
 [KSampler]
 ```
@@ -63,7 +69,7 @@ ComfyUI/
       ↓
 [Apply LoRA / FreeU 등]
       ↓
-[DCW + CWM + SMC Model Patch]  ← 가능하면 파이프라인 마지막에 연결 권장
+[DCW(+a)]  ← 가능하면 파이프라인 마지막에 연결 권장
       ↓
 [KSampler]
 ```
@@ -72,6 +78,8 @@ ComfyUI/
 > 이미 같은 훅을 사용하는 노드가 앞에 연결되어 있으면
 > CWM과 SMC는 자동으로 skip되고 콘솔에 경고가 출력됩니다.
 > DCW(`sampler_post_cfg_function`)는 항상 안전하게 체이닝됩니다.
+> RDC는 별도 훅이 아니라 DCW 훅 내부에서 동작하며, `rdc_tau = 0.0`(기본값)이면
+> 완전히 no-op이라 DCW 단독 사용 시 결과에 어떠한 영향도 주지 않습니다.
 
 > **노드 전체 비활성화**: ComfyUI의 기본 기능인 노드 bypass(우클릭 → Bypass)를 사용하세요.
 
@@ -286,6 +294,68 @@ unit_2 방식에서 k는 매 스텝 보정 벡터의 L2 norm을 정확히 k로 �
 
 ---
 
+### RDC 파라미터 — Band-wise Reverse Drift Compensation
+
+RDC는 DCW와 다른 문제를 풉니다. DCW가 "이번 step이 같은 step의 x_t에서 얼마나 벗어났는지"를 매번 순간적으로 비교하는 반면, RDC는 "여러 step에 걸쳐 구도/포즈가 서서히 한쪽으로 새는 현상(trajectory drift)"을 잡습니다. DCW 훅 안에서 이미 끝난 wavelet 분해(LL/LH/HL/HH)를 그대로 재사용하므로 별도의 변환 비용이 없습니다.
+
+```
+ema_X_new   = (1 − β) · ema_X_prev + β · X_current      ← 대역별 독립 EMA
+drift_X     = X_current − ema_X_new
+X_corrected = X_current − alpha_X · drift_X
+
+β = 1 − exp(−Δs / τ)          Δs = 이번 step의 sigma_norm 이동폭
+```
+
+LL(구조)과 HH(텍스처)는 성격이 반대입니다. LL은 여러 step에 걸쳐 천천히 일관되게 변해야 정상이라 여기서의 drift가 "얼굴이 계속 바뀐다", "포즈가 흔들린다"의 실체에 가깝습니다. 반대로 HH는 매 step 다시 생성돼도 정상인 성분이라, 여기에 EMA 보정을 걸면 텍스처가 과거 평균 쪽으로 당겨져 디테일이 뭉개질 위험이 있습니다. 그래서 LL은 강하게, HH는 기본값 0(꺼짐)으로 두는 것을 권장합니다. LH/HL은 기존 DCW 코드의 관례를 따라 `(alpha_LL + alpha_HH) / 2`로 자동 계산되어 별도 파라미터가 없습니다.
+
+**별도 on/off 토글이 없는 이유**: `rdc_tau = 0.0`이면 `β`가 항상 0으로 계산되어(`Δs/τ → ∞` → `exp(−∞) = 0`... 정확히는 아래 `rdc_tau` 설명 참고) drift 자체가 0이 되므로 자동으로 no-op이 됩니다. 파라미터 하나(`rdc_tau`)가 강도 조절과 on/off 역할을 겸합니다.
+
+---
+
+#### `rdc_tau` — EMA 기억 구간 (on/off 겸용)
+
+`sigma_norm`(`[0, 1)` 범위, 스케줄러·step 수 무관) 기준으로 EMA가 "얼마나 오래 기억하는지"를 결정합니다. τ만큼 sigma_norm이 진행되면 이전 기억이 약 37%(1/e)로 줄어듭니다.
+
+| 값 | 동작 |
+|----|------|
+| `0.0` | RDC 완전 비활성 (기본값). DCW 단독 사용과 동일 |
+| `0.05 ~ 0.10` | drift에 빠르게 반응, 짧은 기억. 미세한 흔들림까지 잡아내지만 과민할 수 있음 |
+| `0.15 ~ 0.20` | 절충 지점. 서서히 진행되는 drift 억제, 정상적인 step-to-step 변화는 유지 |
+| `0.30 이상` | 느리게 반응, 긴 기억. 과하면 구도가 초반 상태에 "고착"되어 의도한 변화도 억제됨 |
+
+> step 수나 karras/exponential 등 스케줄러 종류를 바꿔도 같은 τ 값이 항상 동일한 "노이즈 비율 구간"을 기억하도록 설계되어 있어, step 수를 바꿀 때마다 재조정할 필요가 적습니다.
+
+---
+
+#### `rdc_alpha_ll` — 구조 대역(LL) drift 보정 강도
+
+구도, 포즈, 전체 실루엣이 EMA 기준선에서 벗어난 만큼을 되돌리는 강도입니다. `rdc_tau = 0.0`이면 값과 무관하게 효과 없음.
+
+| 범위 | 체감 효과 |
+|------|-----------|
+| `0.0` | 보정 없음 |
+| `0.02 ~ 0.05` | 권장 시작 범위. 구도/포즈의 완만한 표류를 억제하면서 정상적인 변화는 허용 |
+| `0.05 ~ 0.10` | 구도 안정성 강하게 유지. 과하면 프롬프트가 의도한 변화(예: 다른 포즈로 유도)까지 억제될 수 있음 |
+| `0.10 이상` | 구도가 사실상 "고정"됨. 초반 노이즈에서 결정된 구도에서 벗어나기 어려워짐 |
+
+**음수는 지원하지 않습니다.** DCW의 `lambda_l`/`lambda_h`나 CWM의 `alpha_l`/`alpha_h`는 음수가 "반대 방향의 정상적인 보정"이라는 유효한 의미를 갖지만, RDC의 alpha가 음수가 되면 `current - alpha·drift`의 부호가 뒤집혀 `current + |alpha|·drift`, 즉 자기 자신의 EMA 기준선에서 매 step 더 멀어지는 방향으로 밀어내는 발산성 되먹임 루프가 됩니다. 안정화가 아니라 발산을 조장하므로 UI에서 `min = 0.0`으로 제한해 두었습니다.
+
+---
+
+#### `rdc_alpha_hh` — 텍스처 대역(HH) drift 보정 강도
+
+기본값 0(꺼짐)을 권장합니다. HH는 원래 step마다 새로 생성되는 게 정상이라, 여기에 EMA 보정을 걸면 텍스처가 흐려질 위험이 큽니다.
+
+| 범위 | 체감 효과 |
+|------|-----------|
+| `0.0` | 권장 기본값. 텍스처/그레인은 매 step 자유롭게 재생성 |
+| `0.001 ~ 0.01` | 텍스처 flicker(깜빡임)가 눈에 띌 때만 소량 시도. 과하면 디테일 뭉개짐 |
+| `0.01 이상` | 비권장. 블러 발생 위험이 alpha_LL보다 훨씬 큼 |
+
+`rdc_alpha_ll`과 마찬가지로 음수는 지원하지 않습니다(동일한 발산 문제).
+
+---
+
 ## 모델별 권장 시작값
 
 ### DCW
@@ -316,6 +386,17 @@ unit_2 방식에서 k는 매 스텝 보정 벡터의 L2 norm을 정확히 k로 �
 
 `Auto` 프리셋이 대부분의 경우 최적값을 자동 선택합니다.
 모델이 자동 감지되지 않거나 결과가 만족스럽지 않을 때만 `Custom`을 사용하세요.
+
+### RDC
+
+| 모델 | `rdc_tau` | `rdc_alpha_ll` | `rdc_alpha_hh` |
+|------|-----------|---------------|---------------|
+| SDXL / SD1.5 / DiT | 0.15 | 0.03 | 0.0 |
+| **Flux** | 0.15 | 0.03 | 0.0 |
+| **Anima (Cosmos)** | 0.15 | 0.03 | 0.0 |
+| EDM | 0.15 | 0.03 | 0.0 |
+
+> RDC는 DCW/CWM처럼 모델군별로 검증된 값이 없습니다. 위 표는 개발 문서에 명시된 "실험적으로 검증되지 않은 추정값"을 그대로 옮긴 것으로, 모든 모델에 동일한 시작값을 제시하는 이유도 검증 부족 때문입니다. 실제 사용 시 8-step/20-step 등 자신의 step 수에서 직접 A/B 비교를 권장합니다.
 
 ---
 
@@ -353,6 +434,22 @@ DCW: 그 결과로 나온 x0_pred의 SNR 편향을 post-cfg 훅으로 보정
 세 기능의 개입 위치가 다르므로 충돌 없이 상호보완적으로 작동합니다.
 파라미터를 각각 단독으로 먼저 조정한 뒤 합치는 것을 권장합니다.
 
+### RDC 추가 (구도/포즈가 step을 거치며 표류할 때)
+`rdc_tau > 0.0`으로 설정하면 DCW 훅 안에서 RDC가 함께 작동합니다.
+CWM/SMC 활성 여부와는 무관하게 독립적으로 켤 수 있지만, **`dcw_enabled = True`가 반드시 필요**합니다.
+RDC는 별도 훅이 아니라 DCW 훅(`sampler_post_cfg_function`) 내부에 있으므로,
+`dcw_enabled = False`면 훅 자체가 등록되지 않아 RDC도 함께 꺼집니다.
+DCW의 보정 항(`lambda_l`, `lambda_h`)만 끄고 RDC만 쓰고 싶다면
+`dcw_enabled = True`인 채로 `lambda_l = lambda_h = 0.0`으로 두면 됩니다
+(DCW 자체의 보정은 0이 되고, wavelet 분해 결과 위에 RDC만 순수하게 적용됨).
+
+```
+[DCW+CWM+SMC 조정 완료] → rdc_tau = 0.15, rdc_alpha_ll = 0.03 부터 시작
+  → 여러 시드로 같은 프롬프트 반복 생성
+  → 포즈/구도가 시드 간에도 과도하게 비슷해지면(다양성 손실) rdc_alpha_ll 감소
+  → 여전히 표류가 보이면 rdc_alpha_ll을 0.05~0.08로 소폭 증가
+```
+
 ---
 
 ## 튜닝 팁
@@ -363,7 +460,8 @@ DCW: 그 결과로 나온 x0_pred의 SNR 편향을 post-cfg 훅으로 보정
 2. `dcw_enabled = False`, `cwm_enabled = True`, `smc_preset = Off` → CWM 단독 조정
 3. `dcw_enabled = False`, `cwm_enabled = True`, `smc_preset = Auto` → SMC 추가 효과 확인
 4. 모두 활성화 후 `dcw_enabled` / `cwm_enabled` / `smc_preset` 개별 토글로 각 기여분 확인
-5. 노드 전체 A/B 비교는 ComfyUI 기본 기능인 노드 bypass를 사용
+5. 마지막으로 `rdc_tau`를 0.0에서 서서히 올려가며 구도/포즈 안정성 변화만 별도로 확인
+6. 노드 전체 A/B 비교는 ComfyUI 기본 기능인 노드 bypass를 사용
 
 **스텝 수가 적을수록 효과가 더 큽니다.** 10–20 스텝에서 차이가 가장 명확합니다.
 
@@ -372,6 +470,8 @@ DCW: 그 결과로 나온 x0_pred의 SNR 편향을 post-cfg 훅으로 보정
 - 텍스처 노이즈처럼 보이는 디테일 → `lambda_h` 또는 `alpha_h` 감소
 - 구도·구조가 원본과 달라짐 → `lambda_l` 또는 `alpha_l` 감소
 - 이미지가 과도하게 선명하거나 엣지가 튀는 느낌 → `smc_k` 감소 또는 `smc_preset = Off`
+- 같은 프롬프트인데 시드를 바꿔도 구도/포즈가 지나치게 비슷해짐(다양성 손실) → `rdc_alpha_ll` 감소 또는 `rdc_tau` 감소
+- 텍스처가 뭉개지거나 흐릿해짐(RDC 사용 중) → `rdc_alpha_hh`를 0.0으로 되돌림
 
 ---
 
@@ -458,7 +558,45 @@ e*     = e + Δe
 
 ---
 
-## 기술적 참고사항
+## RDC 배경: 순간 보정과 궤적 보정은 다른 문제다
+
+DCW는 매 step마다 `denoised`(x0_pred)를 **같은 step의 x_t**하고만 비교해서 보정합니다. 이 방식은 "이번 step이 원래 궤적에서 얼마나 벗어났는지"는 잡아내지만, 여러 step에 걸쳐 누적되는 drift(얼굴/포즈/구도가 step을 거치며 서서히 옆으로 새는 현상)는 다루지 않습니다. DCW는 순간(instantaneous) 보정이고, RDC는 궤적(trajectory) 보정이라는 점에서 서로 다른 문제를 풉니다.
+
+### 원형 개념과의 차이
+
+최초 검토된 원형 RDC는 아래와 같이 ε(noise prediction) 전체를 단일 텐서로 다룹니다.
+
+```
+d_t        = ε_t − EMA(ε)
+EMA        = 0.95·EMA + 0.05·ε
+ε_correct  = ε − α·d
+```
+
+본 구현은 이를 DCW 구조에 맞춰 확장한 버전입니다.
+
+| 항목 | 원형 RDC | 본 구현 (Band-wise RDC) |
+|---|---|---|
+| 보정 대상 | ε 전체, 단일 텐서 | `denoised`를 Haar wavelet로 분해한 LL/LH/HL/HH 4개 대역 각각 |
+| 적용 위치 | 명시 안 됨 | DCW의 `apply_dcw` 내부, `sampler_post_cfg_function` 훅 |
+| EMA 개수 | 1개 | 4개 (대역별 독립 EMA 상태) |
+| EMA 시간축 | step 기준 고정 β | `sigma_norm` 기준으로 유도되는 가변 β |
+| 강도 파라미터 | α 1개 | `alpha_LL`, `alpha_HH` 2개 (LH/HL은 보간) |
+
+전역 텐서 하나에 동일한 α로 EMA 보정을 거는 원형보다, 대역을 나눠 LL은 강하게·HH는 약하게(또는 0으로) 보정하는 편이 부작용 없이 구도 안정화를 달성하는 데 더 정밀하다고 판단해 확장했습니다.
+
+### 상태(state) 저장
+
+SMC와 동일한 패턴으로 `model_options`에 `_dcw_rdc_state` 키로 대역별 EMA 텐서와 이전 `sigma_norm` 값을 저장합니다. `model_options`는 KSampler 실행마다 새로 생성되는 dict이므로 실행 간 상태가 자동으로 초기화됩니다. 첫 step에는 각 대역의 EMA를 현재값으로만 시딩하고 보정은 적용하지 않습니다(기준선이 없는 상태에서 보정하면 의미가 없기 때문).
+
+### 검증되지 않은 부분 (투명하게 명시)
+
+- `alpha_LL`, `alpha_HH`, `τ`의 기본값은 DCW/SMC 파라미터 스케일에서 유추한 추정값이며, 실험적으로 A/B 검증되지 않았습니다.
+- Wavelet-CFG 보정 노드에 band-wise EMA drift compensation을 통합하는 이 방식이 기존 논문에 선례가 있는지는 제한된 검색 범위 내에서 확인되지 않았습니다. 전수조사는 아니므로 "새로운 기법"이라 단정할 수는 없습니다.
+- 채널별 에너지 가중치(`_ch_energy_weight`, DCW가 사용 중)를 RDC의 drift 계산에도 재사용할지는 미정입니다. 현재 구현은 재사용하지 않습니다.
+
+---
+
+
 
 **Haar 웨이블릿 선택 이유**
 추가 의존성 없이 PyTorch 텐서 연산만으로 구현 가능하고, 연산이 가장 빠릅니다.
@@ -475,7 +613,11 @@ SMC 연산은 항상 float32로 수행되고 원본 dtype으로 복원됩니다.
 **연산 비용**
 DCW 논문 실험 기준 추가 연산 시간 **0.08 – 0.47%** 수준.
 CWM과 SMC는 guidance error에 DWT/IDWT 1회 및 L2 norm 연산이 추가되므로 동일 수준입니다.
+RDC는 DCW가 이미 수행한 wavelet 분해 결과를 그대로 재사용하므로 추가 DWT/IDWT 비용이 없고, 대역별 EMA 갱신(elementwise 연산)만 추가되어 오버헤드가 미미합니다.
 샘플링 속도에 실질적 영향이 없습니다.
+
+**RDC 상태 초기화**
+`model_options`가 KSampler 실행마다 새로 생성되는 dict이므로, RDC의 대역별 EMA 상태도 매 생성(run)마다 자동으로 초기화됩니다. 배치 크기나 해상도가 이전 step과 달라지면(예: 해상도 변경) 해당 대역의 EMA는 새로 시딩되고 그 step은 보정 없이 넘어갑니다.
 
 ---
 

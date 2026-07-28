@@ -62,6 +62,8 @@ SMC hyperparameter presets  (λ, k) — paper Sec 7.3 / Table 3
   Cosmos / Wan  λ=6, k=0.20  (conservative)
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -88,6 +90,10 @@ _SMC_STATE_KEY = "_dcw_smc_state"
 
 # SMC minimum scale guard (prevents division by zero in tanh normalisation)
 _SMC_CLAMP_MIN   = 1e-6
+
+# State key for cross-step RDC EMA persistence inside model_options.
+# Same pattern as _SMC_STATE_KEY — fresh dict per KSampler run → auto-resets.
+_RDC_STATE_KEY = "_dcw_rdc_state"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -292,7 +298,11 @@ def apply_dcw(denoised: torch.Tensor,
               x_t:      torch.Tensor,
               sigma,
               lambda_l: float,
-              lambda_h: float) -> torch.Tensor:
+              lambda_h: float,
+              rdc_alpha_ll: float = 0.03,
+              rdc_alpha_hh: float = 0.0,
+              rdc_tau:      float = 0.0,
+              rdc_state:    dict | None = None) -> torch.Tensor:
     """
     Apply Differential Correction in Wavelet domain to x0_pred.
 
@@ -325,7 +335,8 @@ def apply_dcw(denoised: torch.Tensor,
     is approximately uniform across channels → weights ≈ 1 → no artificial
     bias is introduced where the reference signal is not yet meaningful.
     """
-    if lambda_l == 0.0 and lambda_h == 0.0:
+    rdc_on = rdc_tau > 0.0
+    if lambda_l == 0.0 and lambda_h == 0.0 and not rdc_on:
         return denoised
 
     orig_dtype    = denoised.dtype
@@ -357,6 +368,46 @@ def apply_dcw(denoised: torch.Tensor,
     LH_c = LH_d + lam_mid * cw_LH * (LH_x - LH_d)
     HL_c = HL_d + lam_mid * cw_HL * (HL_x - HL_d)
     HH_c = HH_d + lam_h   * cw_HH * (HH_x - HH_d)
+
+    # ── RDC: band-wise EMA drift compensation (trajectory correction) ──────
+    # Unlike the DCW terms above (instantaneous x_t vs denoised comparison),
+    # RDC corrects cross-step drift by pulling each band back toward its own
+    # running EMA. See DCW_RDC_확장_개발문서.md §3.2–3.3 for derivation.
+    if rdc_on and rdc_state is not None:
+        s_val   = float(s.mean()) if isinstance(s, torch.Tensor) else float(s)
+        s_prev  = rdc_state.get("_s_prev", s_val)
+        delta_s = abs(s_prev - s_val)
+        beta    = 1.0 - math.exp(-delta_s / max(rdc_tau, 1e-6))
+        rdc_state["_s_prev"] = s_val
+
+        alpha_lh_hl = (rdc_alpha_ll + rdc_alpha_hh) * 0.5
+        bands = (("LL", LL_c, rdc_alpha_ll),
+                 ("LH", LH_c, alpha_lh_hl),
+                 ("HL", HL_c, alpha_lh_hl),
+                 ("HH", HH_c, rdc_alpha_hh))
+
+        updated = {}
+        for name, band, alpha in bands:
+            if alpha == 0.0:
+                continue
+            band_detached = band.detach()
+            prev_ema = rdc_state.get(name)
+            if (prev_ema is None
+                    or prev_ema.shape != band_detached.shape
+                    or prev_ema.device != band_detached.device):
+                # First step (or shape/device change, e.g. resolution switch):
+                # no baseline yet, seed the EMA and skip correction this step.
+                rdc_state[name] = band_detached.to(dtype=compute_dtype).clone()
+                continue
+            new_ema = (1.0 - beta) * prev_ema + beta * band_detached
+            rdc_state[name] = new_ema.to(dtype=compute_dtype)
+            drift = band - new_ema
+            updated[name] = band - alpha * drift
+
+        LL_c = updated.get("LL", LL_c)
+        LH_c = updated.get("LH", LH_c)
+        HL_c = updated.get("HL", HL_c)
+        HH_c = updated.get("HH", HH_c)
 
     out = haar_idwt2d(LL_c, LH_c, HL_c, HH_c)
     out = out[..., :H, :W]
@@ -702,6 +753,66 @@ class DCWModelPatch:
                         "High k → stronger text alignment, risk of chattering."
                     ),
                 }),
+
+                # ── RDC parameters ─────────────────────────────────────────────
+                # No separate on/off toggle: rdc_tau = 0.0 fully disables RDC
+                # (β always evaluates to 0 → drift always 0 → no-op, see apply_dcw),
+                # rdc_tau > 0.0 enables it. Keeps the parameter count at 3.
+                "rdc_tau": ("FLOAT", {
+                    "default": 0.0,
+                    "min":     0.0,
+                    "max":     0.5,
+                    "step":    0.01,
+                    "round":   0.001,
+                    "tooltip": (
+                        "[RDC] Band-wise EMA drift compensation — on/off AND time-\n"
+                        "constant in one value.\n"
+                        "0.0 = RDC fully OFF (default; identical to not having RDC).\n"
+                        "> 0.0 = RDC ON. Value = memory span in sigma_norm units\n"
+                        "([0,1) range, scheduler/step-count independent): after the\n"
+                        "sampler has moved this far in sigma_norm, the EMA's memory\n"
+                        "of older steps has decayed to ~37%.\n"
+                        "Smaller (e.g. 0.05–0.1) → reacts fast, short memory.\n"
+                        "Larger (e.g. 0.2–0.3) → reacts slowly, long memory, smoother.\n"
+                        "Corrects cross-step trajectory drift (pose/face/composition\n"
+                        "slowly wandering over steps) — different from DCW, which only\n"
+                        "compares each step to itself, not the trajectory.\n"
+                        "Reuses DCW's existing wavelet decomposition (no extra cost)."
+                    ),
+                }),
+
+                "rdc_alpha_ll": ("FLOAT", {
+                    "default": 0.03,
+                    "min":     0.0,
+                    "max":     0.3,
+                    "step":    0.005,
+                    "round":   0.001,
+                    "tooltip": (
+                        "[RDC] Structure-band (LL) drift correction strength.\n"
+                        "Pulls the low-frequency band back toward its running EMA\n"
+                        "each step, damping slow composition/pose drift.\n"
+                        "Has no effect while rdc_tau = 0.0 (RDC off).\n"
+                        "Suggested start: 0.02–0.05.\n"
+                        "Too high → composition gets 'stuck', resists intended change."
+                    ),
+                }),
+
+                "rdc_alpha_hh": ("FLOAT", {
+                    "default": 0.0,
+                    "min":     0.0,
+                    "max":     0.1,
+                    "step":    0.001,
+                    "round":   0.001,
+                    "tooltip": (
+                        "[RDC] Texture-band (HH) drift correction strength.\n"
+                        "HH is expected to regenerate every step (grain/detail);\n"
+                        "correcting it pulls detail toward a blurred running average.\n"
+                        "0.0 (default) = off — recommended unless you see texture\n"
+                        "flicker you specifically want to dampen.\n"
+                        "Suggested ceiling if used: ~0.01. Higher values blur detail.\n"
+                        "Has no effect while rdc_tau = 0.0 (RDC off)."
+                    ),
+                }),
             }
         }
 
@@ -716,9 +827,12 @@ class DCWModelPatch:
         alpha_l:     float,
         alpha_h:     float,
         cwm_enabled: bool,
-        smc_preset:  str,
-        smc_lambda:  float,
-        smc_k:       float,
+        smc_preset:   str,
+        smc_lambda:   float,
+        smc_k:        float,
+        rdc_tau:      float = 0.0,
+        rdc_alpha_ll: float = 0.03,
+        rdc_alpha_hh: float = 0.0,
     ):
         # ── Resolve SMC hyperparameters ───────────────────────────────────────
         smc_on = (smc_preset != "Off")
@@ -738,7 +852,8 @@ class DCWModelPatch:
             resolved_lambda = resolved_k = 0.0
 
         # ── Determine active features ─────────────────────────────────────────
-        dcw_active = dcw_enabled and (lambda_l != 0.0 or lambda_h != 0.0)
+        rdc_on = rdc_tau > 0.0
+        dcw_active = dcw_enabled and (lambda_l != 0.0 or lambda_h != 0.0 or rdc_on)
         # cfg hook is needed if CWM alpha is non-zero OR SMC is on
         cwm_alpha_active = cwm_enabled and (alpha_l != 0.0 or alpha_h != 0.0)
         cfg_hook_needed  = cwm_alpha_active or smc_on
@@ -802,8 +917,22 @@ class DCWModelPatch:
         # ── Post-CFG hook: DCW ────────────────────────────────────────────────
         if dcw_active:
             existing_fns = list(m.model_options.get("sampler_post_cfg_function", []))
-            _ll = lambda_l
-            _lh = lambda_h
+            _ll        = lambda_l
+            _lh        = lambda_h
+            _rdc       = rdc_on
+            _rdc_a_ll  = rdc_alpha_ll if rdc_on else 0.0
+            _rdc_a_hh  = rdc_alpha_hh if rdc_on else 0.0
+            _rdc_tau   = rdc_tau if rdc_on else 0.0
+            # model_options is a fresh dict per KSampler run, but the closure
+            # persists across the node's lifetime — same pattern as the SMC
+            # cfg_hook above (_model_options_ref fallback).
+            _model_options_ref_dcw = m.model_options
+
+            if rdc_on:
+                print(
+                    f"[DCW/RDC] Band-wise drift compensation ON  "
+                    f"alpha_LL={_rdc_a_ll}  alpha_HH={_rdc_a_hh}  tau={_rdc_tau}"
+                )
 
             def dcw_post_cfg(args: dict) -> torch.Tensor:
                 denoised = args.get("denoised")
@@ -814,7 +943,18 @@ class DCWModelPatch:
                     return denoised
 
                 try:
-                    return apply_dcw(denoised, x_t, sigma, _ll, _lh)
+                    rdc_state = None
+                    if _rdc:
+                        opts = args.get("model_options", _model_options_ref_dcw)
+                        rdc_state = opts.setdefault(_RDC_STATE_KEY, {})
+
+                    return apply_dcw(
+                        denoised, x_t, sigma, _ll, _lh,
+                        rdc_alpha_ll=_rdc_a_ll,
+                        rdc_alpha_hh=_rdc_a_hh,
+                        rdc_tau=_rdc_tau,
+                        rdc_state=rdc_state,
+                    )
                 except Exception as exc:
                     print(f"[DCW] Warning: correction skipped at this step – {exc}")
                     return denoised
@@ -834,5 +974,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DCWModelPatch": "DCW + CWM + SMC Model Patch",
+    "DCWModelPatch": "DCW(+a)",
 }
